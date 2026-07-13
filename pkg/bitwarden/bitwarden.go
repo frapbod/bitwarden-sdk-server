@@ -16,9 +16,11 @@ package bitwarden
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/bitwarden/sdk-go/v2"
 )
@@ -32,6 +34,7 @@ const (
 	defaultAPIURL      = "https://api.bitwarden.com"
 	defaultIdentityURL = "https://identity.bitwarden.com"
 	defaultStatePath   = ".bitwarden-state"
+	maxCachedClients   = 8
 )
 
 // Defined Header Keys.
@@ -78,7 +81,6 @@ func Login(req *LoginRequest) (sdk.BitwardenClientInterface, error) {
 	identityURL := setOrDefault(req.IdentityURL, defaultIdentityURL)
 	statePath := setOrDefault(req.StatePath, defaultStatePath)
 
-	// Client is closed in the calling handlers.
 	slog.Debug("constructed client with api and identity url", "api", apiURL, "identityUrl", identityURL, "statePath", statePath)
 	bitwardenClient, err := newBitwardenClientFn(&apiURL, &identityURL)
 	if err != nil {
@@ -86,6 +88,7 @@ func Login(req *LoginRequest) (sdk.BitwardenClientInterface, error) {
 	}
 
 	if err := bitwardenClient.AccessTokenLogin(req.AccessToken, &statePath); err != nil {
+		bitwardenClient.Close()
 		return nil, fmt.Errorf("bitwarden login: %w", err)
 	}
 
@@ -101,6 +104,13 @@ func Login(req *LoginRequest) (sdk.BitwardenClientInterface, error) {
 // Put the client into the context and so if a context contains our client
 // we know that calls are authenticated.
 func Warden(next http.Handler) http.Handler {
+	// The SDK client owns an authenticated Secrets Manager session. Reuse one
+	// client per credential set instead of logging in for every secret read.
+	// Holding the mutex through the request also keeps SDK access serialized;
+	// the SDK does not document a concurrent-use contract.
+	var mu sync.Mutex
+	clients := make(map[[sha256.Size]byte]sdk.BitwardenClientInterface)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get(WardenHeaderAccessToken)
 		if token == "" {
@@ -118,14 +128,34 @@ func Warden(next http.Handler) http.Handler {
 			StatePath:   r.Header.Get(WardenHeaderStatePath),
 		}
 
-		// Make sure every request gets its own client that it will close after it's done.
-		client, err := Login(loginRequest)
-		if err != nil {
-			http.Error(w, "failed to login to bitwarden using access token: "+err.Error(), http.StatusBadRequest)
+		cacheKey := sha256.Sum256([]byte(
+			loginRequest.AccessToken + "\x00" +
+				loginRequest.APIURL + "\x00" +
+				loginRequest.IdentityURL + "\x00" +
+				loginRequest.StatePath,
+		))
 
-			return
+		mu.Lock()
+		defer mu.Unlock()
+
+		client, ok := clients[cacheKey]
+		if !ok {
+			if len(clients) >= maxCachedClients {
+				for key, cachedClient := range clients {
+					cachedClient.Close()
+					delete(clients, key)
+				}
+			}
+
+			var err error
+			client, err = Login(loginRequest)
+			if err != nil {
+				http.Error(w, "failed to login to bitwarden using access token: "+err.Error(), http.StatusBadRequest)
+
+				return
+			}
+			clients[cacheKey] = client
 		}
-		defer client.Close()
 
 		ctx := context.WithValue(r.Context(), ContextClientKey, client)
 		next.ServeHTTP(w, r.WithContext(ctx))
