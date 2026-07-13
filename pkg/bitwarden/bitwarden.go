@@ -16,11 +16,13 @@ package bitwarden
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/bitwarden/sdk-go/v2"
 )
@@ -33,6 +35,7 @@ var ContextClientKey contextKey = "warden-client"
 const (
 	defaultAPIURL      = "https://api.bitwarden.com"
 	defaultIdentityURL = "https://identity.bitwarden.com"
+	maxCachedClients   = 8
 )
 
 // DefaultStatePath uses distroless nonroot image's /home/nonroot as 0700 owned by uid 65532.
@@ -120,6 +123,10 @@ func NewWarden(statePath string) func(http.Handler) http.Handler {
 }
 
 func warden(next http.Handler, statePath string) http.Handler {
+	// Serialize SDK use and eviction: the SDK does not document concurrent use.
+	var mu sync.Mutex
+	clients := make(map[[sha256.Size]byte]sdk.BitwardenClientInterface)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get(WardenHeaderAccessToken)
 		if token == "" {
@@ -137,14 +144,45 @@ func warden(next http.Handler, statePath string) http.Handler {
 			StatePath:   r.Header.Get(WardenHeaderStatePath),
 		}
 
-		// Make sure every request gets its own client that it will close after it's done.
-		client, err := Login(loginRequest, statePath)
-		if err != nil {
-			http.Error(w, "failed to login to bitwarden using access token: "+err.Error(), http.StatusBadRequest)
-
+		// An empty effective path explicitly disables session persistence.
+		if setOrDefault(loginRequest.StatePath, statePath) == "" {
+			client, err := Login(loginRequest, statePath)
+			if err != nil {
+				http.Error(w, "failed to login to bitwarden using access token: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer client.Close()
+			ctx := context.WithValue(r.Context(), ContextClientKey, client)
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		defer client.Close()
+
+		cacheKey := sha256.Sum256([]byte(
+			loginRequest.AccessToken + "\x00" +
+				setOrDefault(loginRequest.APIURL, defaultAPIURL) + "\x00" +
+				setOrDefault(loginRequest.IdentityURL, defaultIdentityURL) + "\x00" +
+				setOrDefault(loginRequest.StatePath, statePath),
+		))
+		mu.Lock()
+		defer mu.Unlock()
+
+		client, ok := clients[cacheKey]
+		if !ok {
+			if len(clients) >= maxCachedClients {
+				for key, cachedClient := range clients {
+					cachedClient.Close()
+					delete(clients, key)
+				}
+			}
+
+			var err error
+			client, err = Login(loginRequest, statePath)
+			if err != nil {
+				http.Error(w, "failed to login to bitwarden using access token: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			clients[cacheKey] = client
+		}
 
 		ctx := context.WithValue(r.Context(), ContextClientKey, client)
 		next.ServeHTTP(w, r.WithContext(ctx))
